@@ -282,7 +282,7 @@ describe("ssh env-lab fixture", () => {
     const rootDir = await createFixtureRootDir();
     const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH attachment queue test");
     if (!started) {
-      if (process.env.PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB === "1") throw new Error(sshEnvLabUnsupportedReason ?? "SSH fixture did not start.");
+      if (process.env.CI === "true" || process.env.PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB === "1") throw new Error(sshEnvLabUnsupportedReason ?? "SSH fixture did not start.");
       return;
     }
     const spec = { ...await buildSshEnvLabFixtureConfig(started), remoteCwd: started.workspaceDir };
@@ -326,7 +326,7 @@ describe("ssh env-lab fixture", () => {
     const rootDir = await createFixtureRootDir();
     const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH attachment bridge test");
     if (!started) {
-      if (process.env.PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB === "1") throw new Error(sshEnvLabUnsupportedReason ?? "SSH fixture did not start.");
+      if (process.env.CI === "true" || process.env.PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB === "1") throw new Error(sshEnvLabUnsupportedReason ?? "SSH fixture did not start.");
       return;
     }
     const prefix = Buffer.from("--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n");
