@@ -1,4 +1,5 @@
 import {
+  chmod,
   cp,
   mkdir,
   lstat,
@@ -7269,10 +7270,16 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
   // native wrapper, like the real OpenCode binary; a shebang script would need
   // to reopen the now-unlinked path in its interpreter.
   const executable = join(root, "fake-opencode");
+  // Qualified launch rejects the group-writable Node found on some CI hosts.
+  const qualifiedNode = join(root, "node");
+  await cp(process.execPath, qualifiedNode, { dereference: true });
+  await chmod(qualifiedNode, 0o755);
   const fixture = resolve("test/fixtures/fake-opencode-server.mjs");
   execFileSync("cc", ["-x", "c", "-o", executable, "-"], {
-    input: `#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { char **args = calloc(argc + 2, sizeof(char *)); args[0] = ${JSON.stringify(process.execPath)}; args[1] = ${JSON.stringify(fixture)}; for (int i = 1; i < argc; i++) args[i + 1] = argv[i]; execv(args[0], args); return 127; }`,
+    input: `#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { char **args = calloc(argc + 2, sizeof(char *)); args[0] = ${JSON.stringify(qualifiedNode)}; args[1] = ${JSON.stringify(fixture)}; for (int i = 1; i < argc; i++) args[i + 1] = argv[i]; execv(args[0], args); return 127; }`,
   });
+  // CI's umask 0002 can also make the compiler output group-writable.
+  await chmod(executable, 0o755);
   // Use the production bundler without depending on (or mutating) shared dist
   // artifacts. The Vitest CI lane builds Rust but does not build TypeScript.
   const proxy = join(root, "opencode-app-server-proxy.cjs");
@@ -7294,8 +7301,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand: qualifiedNode,
+    providerNodeCommandSha256: digest(qualifiedNode),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({
