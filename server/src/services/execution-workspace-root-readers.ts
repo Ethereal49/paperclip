@@ -5,7 +5,6 @@ import type { AuthorizationActor } from "./authorization.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { loadRunCleanupStates } from "./execution-blocker.js";
-import { isHeartbeatRunTerminalStatus } from "./heartbeat/run-lifecycle.js";
 
 type ReaderDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type ReaderEntry = Pick<typeof executionWorkspaceRepositoryAccess.$inferSelect, "scopeId" | "issueId" | "agentId" | "responsibleUserId">;
@@ -59,7 +58,7 @@ export async function loadRepositoryRootReaders<T extends ReaderEntry>(db: Reade
     }
     if (!run || !agent || !issue) {
       if (entry.scopeId === requiredRunId) throw forbidden("Repository root retains a reader whose identity is no longer available");
-      if (run && (!isHeartbeatRunTerminalStatus(run.status) || !run.finishedAt || run.controllerLeaseExpiresAt)) {
+      if (run && (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status) || !run.finishedAt || run.controllerLeaseExpiresAt)) {
         throw forbidden("Repository root retains a reader whose execution has not settled");
       }
       if (run) orphanRunIds.add(run.id);
