@@ -1,10 +1,10 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { agents, environmentLeases, heartbeatRuns, issues, projects, executionWorkspaceRepositoryAccess, type Db } from "@paperclipai/db";
+import { inArray, sql } from "drizzle-orm";
+import { agents, heartbeatRuns, issues, projects, executionWorkspaceRepositoryAccess, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
-import { hasPendingRunCleanup } from "./execution-blocker.js";
+import { loadRunCleanupStates } from "./execution-blocker.js";
 import { isHeartbeatRunTerminalStatus } from "./heartbeat/run-lifecycle.js";
 
 type ReaderDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -45,6 +45,7 @@ export async function loadRepositoryRootReaders<T extends ReaderEntry>(db: Reade
     }
   });
   const readers = [];
+  const orphanRunIds = new Set<string>();
   for (const entry of entries) {
     const run = runs.get(entry.scopeId);
     const agent = entry.agentId ? agentRows.get(entry.agentId) : undefined;
@@ -58,19 +59,21 @@ export async function loadRepositoryRootReaders<T extends ReaderEntry>(db: Reade
     }
     if (!run || !agent || !issue) {
       if (entry.scopeId === requiredRunId) throw forbidden("Repository root retains a reader whose identity is no longer available");
-      if (run && (!isHeartbeatRunTerminalStatus(run.status) || !run.finishedAt || run.controllerLeaseExpiresAt
-        || await hasPendingRunCleanup(db, companyId, run.id)
-        || (await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
-          eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
-          eq(environmentLeases.status, "retained"))).limit(1)).length)) {
+      if (run && (!isHeartbeatRunTerminalStatus(run.status) || !run.finishedAt || run.controllerLeaseExpiresAt)) {
         throw forbidden("Repository root retains a reader whose execution has not settled");
       }
+      if (run) orphanRunIds.add(run.id);
       continue;
     }
     const actor: AuthorizationActor = { type: "agent", source: "agent_jwt", companyId,
       agentId: agent.id, runId: run.id, onBehalfOfUserId: entry.responsibleUserId === "local-board" ? null : entry.responsibleUserId };
     readers.push({ entry, run, agent, issue, actor });
   }
+  const cleanup = await loadRunCleanupStates(db, companyId, [...orphanRunIds]);
+  if ([...orphanRunIds].some(id => {
+    const state = cleanup.get(id);
+    return !state || state.pending || state.retained;
+  })) throw forbidden("Repository root retains a reader whose execution has not settled");
   return readers;
 }
 

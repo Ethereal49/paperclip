@@ -15,6 +15,8 @@ import { loadRepositoryRootReaders } from "../services/execution-workspace-root-
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
 import { deleteAgentDependencies } from "../services/agent-deletion.js";
 import { issueService } from "../services/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { hasPendingRunCleanup } from "../services/execution-blocker.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -125,8 +127,10 @@ it("keeps a deleted task's running reader fenced out of later private publicatio
   let grants: typeof projectAccessMembers.$inferSelect[] = [];
   try {
     expect((await once(reader, "message"))[0]).toBe("ready");
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, retainedAgentId));
     await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, processPid: reader.pid,
-      controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })
+      processLossRetryCount: 1, executionStage: "dispatching", controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() - 60_000) })
       .where(eq(heartbeatRuns.id, retainedRunId));
     expect(await issueService(db).remove(retainedIssueId)).not.toBeNull();
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
@@ -134,6 +138,8 @@ it("keeps a deleted task's running reader fenced out of later private publicatio
     expect(run.issueId).toBeNull();
     expect(run.contextSnapshot?.issueId).toBe(retainedIssueId);
     expect(() => process.kill(reader.pid!, 0)).not.toThrow();
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 })).reaped).toBe(0);
     await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, projectId));
     grants = await db.insert(projectAccessMembers).values([
       { companyId, projectId, subjectType: "agent", subjectId: agentId },
@@ -147,6 +153,14 @@ it("keeps a deleted task's running reader fenced out of later private publicatio
     reader.send(file);
     const [privateContent] = await observed;
     expect({ denied: publication?.status, privateContent }).toEqual({ denied: 403, privateContent: null });
+    const exited = once(reader, "exit");
+    reader.kill();
+    await exited;
+    expect((await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 })).runIds).toContain(retainedRunId);
+    const [recovered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
+    expect(recovered.status).toBe("failed");
+    expect(recovered.controllerLeaseExpiresAt).toBeNull();
+    await expect(service.guardForPublication(input())).resolves.toBeUndefined();
   } finally {
     if (reader.exitCode === null && reader.signalCode === null) {
       const exited = once(reader, "exit");
@@ -157,7 +171,7 @@ it("keeps a deleted task's running reader fenced out of later private publicatio
     await db.delete(projectAccessMembers).where(inArray(projectAccessMembers.id, grants.map(grant => grant.id)));
     await db.update(projects).set({ visibility: "open" }).where(eq(projects.id, projectId));
     await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.scopeId, retainedRunId));
-    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
+    await deleteAgentDependencies(db, companyId, retainedAgentId);
     await db.delete(issues).where(eq(issues.id, retainedIssueId));
     await db.delete(agents).where(eq(agents.id, retainedAgentId));
   }
@@ -189,6 +203,29 @@ it.each(["running", "queued", "unknown", "unfinished", "controller", "expired co
     }
   },
 );
+
+it("bounds cleanup queries after more than one batch of retained tasks is deleted", async () => {
+  const ids = Array.from({ length: 501 }, () => ({ runId: randomUUID(), taskId: randomUUID() }));
+  await db.insert(issues).values(ids.map(({ taskId }) => ({ id: taskId, companyId, projectId, title: "Deleted reader task" })));
+  await db.insert(heartbeatRuns).values(ids.map(({ runId, taskId }) => ({ id: runId, companyId, agentId,
+    issueId: taskId, status: "succeeded", finishedAt: new Date(), responsibleUserId: userId, contextSnapshot: { issueId: taskId } })));
+  await db.insert(executionWorkspaceRepositoryAccess).values(ids.map(({ runId, taskId }) => ({ companyId,
+    rootKey: createHash("sha256").update(cwd).digest("hex"), canonicalCwd: cwd, kind: "reader",
+    scopeId: runId, issueId: taskId, agentId, responsibleUserId: userId })));
+  try {
+    await db.delete(issues).where(inArray(issues.id, ids.map(id => id.taskId)));
+    const queries: string[] = [];
+    const recorded = drizzle(db.$client, { schema: db._.fullSchema, logger: { logQuery: query => queries.push(query) } }) as unknown as typeof db;
+    await expect(executionWorkspaceRepositoryService(recorded).guardForPublication(input())).resolves.toBeUndefined();
+    expect(queries.length).toBeLessThan(100);
+    expect(await hasPendingRunCleanup(db, companyId, ids[0].runId.toUpperCase())).toBe(false);
+    expect(await hasPendingRunCleanup(db, companyId, randomUUID())).toBe(true);
+  } finally {
+    await db.delete(executionWorkspaceRepositoryAccess).where(inArray(executionWorkspaceRepositoryAccess.scopeId, ids.map(id => id.runId)));
+    await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, ids.map(id => id.runId)));
+    await db.delete(issues).where(inArray(issues.id, ids.map(id => id.taskId)));
+  }
+});
 
 it.each(["run", "agent", "issue snapshot", "issue FK"])("admits a new reader after deleting a retained %s", async deletion => {
   const { retainedAgentId, retainedIssueId, retainedRunId } = await seedRetainedReader();
