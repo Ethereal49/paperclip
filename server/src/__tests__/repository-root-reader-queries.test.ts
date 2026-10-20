@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,12 +8,13 @@ import path from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryAccess,
+import { agents, authUsers, companies, companyMemberships, createDb, environmentLeases, executionWorkspaceRepositoryAccess,
   executionWorkspaces, heartbeatRuns, issues, projects, projectAccessMembers, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { loadRepositoryRootReaders } from "../services/execution-workspace-root-readers.js";
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
 import { deleteAgentDependencies } from "../services/agent-deletion.js";
+import { issueService } from "../services/issues.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -97,14 +100,95 @@ it("rejects foreign-company and mismatched retained run identities", async () =>
 async function seedRetainedReader() {
   const retainedAgentId = randomUUID(), retainedIssueId = randomUUID(), retainedRunId = randomUUID();
   await db.insert(agents).values({ id: retainedAgentId, companyId, name: "Past reader", adapterType: "process" });
+  await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: retainedAgentId,
+    membershipRole: "member", status: "active" });
   await db.insert(issues).values({ id: retainedIssueId, companyId, projectId, title: "Past task" });
   await db.insert(heartbeatRuns).values({ id: retainedRunId, companyId, agentId: retainedAgentId,
-    responsibleUserId: userId, issueId: retainedIssueId, status: "succeeded", contextSnapshot: { issueId: retainedIssueId } });
+    responsibleUserId: userId, issueId: retainedIssueId, status: "succeeded", finishedAt: new Date(), contextSnapshot: { issueId: retainedIssueId } });
   await db.insert(executionWorkspaceRepositoryAccess).values({ companyId,
     rootKey: createHash("sha256").update(cwd).digest("hex"), canonicalCwd: cwd, kind: "reader",
     scopeId: retainedRunId, issueId: retainedIssueId, agentId: retainedAgentId, responsibleUserId: userId });
   return { retainedAgentId, retainedIssueId, retainedRunId };
 }
+
+it("keeps a deleted task's running reader fenced out of later private publication", async () => {
+  const { retainedAgentId, retainedIssueId, retainedRunId } = await seedRetainedReader();
+  const service = executionWorkspaceRepositoryService(db);
+  await expect(service.guardForPublication(input())).resolves.toBeUndefined();
+  const reader = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    process.on("message", file => process.send(fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null));
+    process.on("disconnect", () => process.exit(0));
+    process.send("ready");
+  `], { cwd, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  const file = path.join(cwd, "private.txt");
+  let grants: typeof projectAccessMembers.$inferSelect[] = [];
+  try {
+    expect((await once(reader, "message"))[0]).toBe("ready");
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, processPid: reader.pid,
+      controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })
+      .where(eq(heartbeatRuns.id, retainedRunId));
+    expect(await issueService(db).remove(retainedIssueId)).not.toBeNull();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
+    expect(run.status).toBe("running");
+    expect(run.issueId).toBeNull();
+    expect(run.contextSnapshot?.issueId).toBe(retainedIssueId);
+    expect(() => process.kill(reader.pid!, 0)).not.toThrow();
+    await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, projectId));
+    grants = await db.insert(projectAccessMembers).values([
+      { companyId, projectId, subjectType: "agent", subjectId: agentId },
+      { companyId, projectId, subjectType: "user", subjectId: userId },
+    ]).returning();
+    const publication = await (async () => {
+      await service.guardForPublication(input());
+      await fs.writeFile(file, "Private project source\n");
+    })().then(() => null, error => error);
+    const observed = once(reader, "message");
+    reader.send(file);
+    const [privateContent] = await observed;
+    expect({ denied: publication?.status, privateContent }).toEqual({ denied: 403, privateContent: null });
+  } finally {
+    if (reader.exitCode === null && reader.signalCode === null) {
+      const exited = once(reader, "exit");
+      reader.kill();
+      await exited;
+    }
+    await fs.rm(file, { force: true });
+    await db.delete(projectAccessMembers).where(inArray(projectAccessMembers.id, grants.map(grant => grant.id)));
+    await db.update(projects).set({ visibility: "open" }).where(eq(projects.id, projectId));
+    await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.scopeId, retainedRunId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
+    await db.delete(issues).where(eq(issues.id, retainedIssueId));
+    await db.delete(agents).where(eq(agents.id, retainedAgentId));
+  }
+});
+
+it.each(["running", "queued", "unknown", "unfinished", "controller", "expired controller", "active", "pending_cleanup", "retained"])(
+  "keeps a deleted task reader fenced while execution is %s", async state => {
+    const { retainedAgentId, retainedIssueId, retainedRunId } = await seedRetainedReader();
+    try {
+      if (["running", "queued", "unknown"].includes(state)) {
+        await db.update(heartbeatRuns).set({ status: state }).where(eq(heartbeatRuns.id, retainedRunId));
+      } else if (state === "unfinished") {
+        await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, retainedRunId));
+      } else if (state.includes("controller")) {
+        await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + (state === "controller" ? 60_000 : -60_000)) })
+          .where(eq(heartbeatRuns.id, retainedRunId));
+      } else {
+        await db.insert(environmentLeases).values({ companyId, heartbeatRunId: retainedRunId, status: state,
+          leasePolicy: "reuse_by_environment", cleanupStatus: state === "retained" ? "success" : null });
+      }
+      await db.delete(issues).where(eq(issues.id, retainedIssueId));
+      await expect(executionWorkspaceRepositoryService(db).guardForPublication(input())).rejects.toThrow("execution has not settled");
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, retainedRunId));
+      await db.delete(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.scopeId, retainedRunId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, retainedRunId));
+      await db.delete(issues).where(eq(issues.id, retainedIssueId));
+      await db.delete(agents).where(eq(agents.id, retainedAgentId));
+    }
+  },
+);
 
 it.each(["run", "agent", "issue snapshot", "issue FK"])("admits a new reader after deleting a retained %s", async deletion => {
   const { retainedAgentId, retainedIssueId, retainedRunId } = await seedRetainedReader();

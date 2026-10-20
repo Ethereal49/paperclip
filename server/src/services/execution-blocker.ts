@@ -12,7 +12,7 @@ import { unreconciledNativeExportPredicate } from "./native-runtime/native-works
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 
-export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
+export async function hasPendingRunCleanup(db: Pick<Db, "execute">, companyId: string, runId: string): Promise<boolean> {
   const [state] = await db.execute<{ pending: boolean }>(sql`SELECT
     ${heartbeatRuns.runnerProfileJson}->>'nativeWorkspaceFinalizationOwner' IS NOT NULL
     OR EXISTS (SELECT 1 FROM ${environmentLeases}

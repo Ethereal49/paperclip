@@ -1,9 +1,11 @@
-import { inArray, sql } from "drizzle-orm";
-import { agents, heartbeatRuns, issues, projects, executionWorkspaceRepositoryAccess, type Db } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { agents, environmentLeases, heartbeatRuns, issues, projects, executionWorkspaceRepositoryAccess, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
+import { hasPendingRunCleanup } from "./execution-blocker.js";
+import { isHeartbeatRunTerminalStatus } from "./heartbeat/run-lifecycle.js";
 
 type ReaderDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type ReaderEntry = Pick<typeof executionWorkspaceRepositoryAccess.$inferSelect, "scopeId" | "issueId" | "agentId" | "responsibleUserId">;
@@ -14,6 +16,7 @@ type ReaderProject = Pick<typeof projects.$inferSelect, "companyId" | "execution
 export const rootReaderRunColumns = {
   id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
   responsibleUserId: heartbeatRuns.responsibleUserId, nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
+  status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
   contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId', 'taskId', ${heartbeatRuns.contextSnapshot}->'taskId', 'executionPolicy', ${heartbeatRuns.contextSnapshot}->'executionPolicy')`,
 };
 
@@ -41,7 +44,8 @@ export async function loadRepositoryRootReaders<T extends ReaderEntry>(db: Reade
         .where(inArray(issues.id, issueIds.slice(offset, offset + 500)))) issueRows.set(row.id, row);
     }
   });
-  return entries.flatMap(entry => {
+  const readers = [];
+  for (const entry of entries) {
     const run = runs.get(entry.scopeId);
     const agent = entry.agentId ? agentRows.get(entry.agentId) : undefined;
     const issue = entry.issueId ? issueRows.get(entry.issueId) : undefined;
@@ -54,12 +58,20 @@ export async function loadRepositoryRootReaders<T extends ReaderEntry>(db: Reade
     }
     if (!run || !agent || !issue) {
       if (entry.scopeId === requiredRunId) throw forbidden("Repository root retains a reader whose identity is no longer available");
-      return [];
+      if (run && (!isHeartbeatRunTerminalStatus(run.status) || !run.finishedAt || run.controllerLeaseExpiresAt
+        || await hasPendingRunCleanup(db, companyId, run.id)
+        || (await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+          eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
+          eq(environmentLeases.status, "retained"))).limit(1)).length)) {
+        throw forbidden("Repository root retains a reader whose execution has not settled");
+      }
+      continue;
     }
     const actor: AuthorizationActor = { type: "agent", source: "agent_jwt", companyId,
       agentId: agent.id, runId: run.id, onBehalfOfUserId: entry.responsibleUserId === "local-board" ? null : entry.responsibleUserId };
-    return [{ entry, run, agent, issue, actor }];
-  });
+    readers.push({ entry, run, agent, issue, actor });
+  }
+  return readers;
 }
 
 export function requiresAnonymousRepositoryAcquisition(input: {
