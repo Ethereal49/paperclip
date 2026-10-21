@@ -160,6 +160,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           crlf: "before\r\nafter",
           lineSeparator: "before\u2028after",
           paragraphSeparator: "before\u2029after",
+          largeLine: "x".repeat(256 * 1024),
         };
         const note = "before\nline\rcarriage\r\ncrlf\u2028line\u2029paragraph";
         await sourceSql`

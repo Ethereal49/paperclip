@@ -407,21 +407,26 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
 }
 
 async function* readLineFeedDelimitedLines(stream: AsyncIterable<string | Buffer>): AsyncGenerator<string> {
-  let pending = "";
+  let lineFragments: string[] = [];
 
   for await (const chunk of stream) {
-    pending += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
-    let newlineIndex = pending.indexOf("\n");
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    let fragmentStart = 0;
+    let newlineIndex = text.indexOf("\n");
     while (newlineIndex !== -1) {
-      const line = pending.slice(0, newlineIndex);
-      pending = pending.slice(newlineIndex + 1);
-      yield line;
-      newlineIndex = pending.indexOf("\n");
+      lineFragments.push(text.slice(fragmentStart, newlineIndex));
+      yield lineFragments.join("");
+      lineFragments = [];
+      fragmentStart = newlineIndex + 1;
+      newlineIndex = text.indexOf("\n", fragmentStart);
+    }
+    if (fragmentStart < text.length) {
+      lineFragments.push(text.slice(fragmentStart));
     }
   }
 
-  if (pending.length > 0) {
-    yield pending;
+  if (lineFragments.length > 0) {
+    yield lineFragments.join("");
   }
 }
 
