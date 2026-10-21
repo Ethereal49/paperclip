@@ -1,6 +1,5 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
@@ -407,14 +406,29 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   }
 }
 
+async function* readLineFeedDelimitedLines(stream: AsyncIterable<string | Buffer>): AsyncGenerator<string> {
+  let pending = "";
+
+  for await (const chunk of stream) {
+    pending += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    let newlineIndex = pending.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = pending.slice(0, newlineIndex);
+      pending = pending.slice(newlineIndex + 1);
+      yield line;
+      newlineIndex = pending.indexOf("\n");
+    }
+  }
+
+  if (pending.length > 0) {
+    yield pending;
+  }
+}
+
 async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
   const raw = createReadStream(backupFile);
   const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
   stream.setEncoding("utf8");
-  const reader = createInterface({
-    input: stream,
-    crlfDelay: Infinity,
-  });
   let statementLines: string[] = [];
 
   const flushStatement = () => {
@@ -424,8 +438,8 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
   };
 
   try {
-    for await (const line of reader) {
-      if (line === STATEMENT_BREAKPOINT) {
+    for await (const line of readLineFeedDelimitedLines(stream)) {
+      if (line === STATEMENT_BREAKPOINT || line === `${STATEMENT_BREAKPOINT}\r`) {
         const statement = flushStatement();
         if (statement.length > 0) {
           yield statement;
@@ -440,7 +454,6 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
       yield trailingStatement;
     }
   } finally {
-    reader.close();
     stream.destroy();
     raw.destroy();
   }
