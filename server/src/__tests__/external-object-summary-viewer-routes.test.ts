@@ -102,6 +102,15 @@ describeEmbeddedPostgres("external object summary viewer access", () => {
       responsibleUserId: "someone-else",
       createdByUserId: "someone-else",
     });
+    await ctx.db.insert(externalObjectMentions).values({
+      companyId,
+      sourceIssueId: privateIssueId,
+      sourceKind: "description",
+      objectId: externalObject!.id,
+      providerKey: "url",
+      detectorKey: "test",
+      objectType: "link",
+    });
     const actor: Express.Request["actor"] = {
       type: "board",
       source: "session",
