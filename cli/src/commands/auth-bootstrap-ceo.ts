@@ -52,6 +52,7 @@ function resolveBaseUrl(
   if (config?.auth.baseUrlMode === "explicit" && config.auth.publicBaseUrl) {
     return normalizeBaseUrl(config.auth.publicBaseUrl);
   }
+  if (fallbackBaseUrl?.trim()) return normalizeServerBaseUrl(fallbackBaseUrl);
   const bind = config?.server.bind ?? inferBindModeFromHost(config?.server.host);
   const host =
     bind === "custom"
@@ -60,18 +61,8 @@ function resolveBaseUrl(
   const isLanWildcard = bind === "lan" || host === "0.0.0.0" || host === "::";
   const allowedHostname = config?.server.allowedHostnames.find((value) => value.trim().length > 0);
   if (isLanWildcard && allowedHostname) {
-    if (fallbackBaseUrl?.trim()) {
-      try {
-        const fallbackUrl = new URL(fallbackBaseUrl.trim());
-        fallbackUrl.hostname = allowedHostname.trim();
-        return fallbackUrl.origin;
-      } catch {
-        return `http://${allowedHostname.trim()}:${config?.server.port ?? 3100}`;
-      }
-    }
     return `http://${allowedHostname.trim()}:${config?.server.port ?? 3100}`;
   }
-  if (fallbackBaseUrl?.trim()) return normalizeServerBaseUrl(fallbackBaseUrl);
   const port = config?.server.port ?? 3100;
   const publicHost = host === "0.0.0.0" || host === "::" || bind === "lan" ? "localhost" : host;
   return `http://${publicHost}:${port}`;

@@ -28,6 +28,7 @@ const publicUrlKeys = [
   "PAPERCLIP_AUTH_PUBLIC_BASE_URL",
   "BETTER_AUTH_URL",
   "BETTER_AUTH_BASE_URL",
+  "PAPERCLIP_ALLOWED_HOSTNAMES",
   "PAPERCLIP_SERVICE_MANAGED",
   "DATABASE_URL",
 ] as const;
@@ -186,15 +187,31 @@ describeEmbeddedPostgres("bootstrapCeoInvite", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   it("uses the configured LAN hostname for the invite URL", async () => {
+    vi.clearAllMocks();
     await bootstrapCeoInvite({
       config: configPath,
       dbUrl: tempDb!.connectionString,
       rotate: false,
-      fallbackBaseUrl: "http://localhost:3100/api",
+      baseUrl: undefined,
     });
 
     const output = loggedText();
     expect(output).toContain("http://paperclip.test:3100/invite/");
     expect(output).not.toContain("http://localhost:3100/invite/");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("uses the running server URL before a stale config hostname", async () => {
+    process.env.PAPERCLIP_ALLOWED_HOSTNAMES = "new.example";
+
+    await bootstrapCeoInvite({
+      config: configPath,
+      dbUrl: tempDb!.connectionString,
+      rotate: false,
+      fallbackBaseUrl: "http://new.example:3100/api",
+    });
+
+    const output = loggedText();
+    expect(output).toContain("http://new.example:3100/invite/");
+    expect(output).not.toContain("http://paperclip.test:3100/invite/");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 });
