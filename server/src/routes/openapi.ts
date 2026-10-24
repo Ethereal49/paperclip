@@ -11852,6 +11852,7 @@ registerCurrentRoute({
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
+    404: r.notFound,
     422: r.unprocessable,
   },
 });
